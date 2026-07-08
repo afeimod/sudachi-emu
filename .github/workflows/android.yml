@@ -84,41 +84,42 @@ jobs:
 
       # ---------------------------------------------------------------
       # 3. Android SDK + NDK 27 + cmake 3.22.1 + build-tools 35
-      #    android-actions/setup-android 不太稳，用官方的 cmdline-tools 自己装
+      #    android-actions/setup-android@v3 在 GH runner 上有个 bug：它把多行 packages
+      #    当成一个带换行的包名丢给 sdkmanager，导致 "Failed to find package" 退出 1。
+      #    改用 runner 预装的 sdkmanager 手装（GitHub ubuntu 镜像上位于
+      #    /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager）。
       # ---------------------------------------------------------------
-      - name: Install Android SDK & NDK
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: '11076708'   # latest cmdline-tools
-          packages: |
-            platform-tools
-            platforms;android-35
-            build-tools;35.0.0
-            ndk;27.0.12077973
-            cmake;3.22.1
-
-      # android-actions/setup-android 没有 output，SDK 默认装到 ANDROID_SDK_ROOT
-      # （GitHub runner 上默认 $HOME/Library/Android/sdk 走 macOS；我们指定到 $ANDROID_SDK_ROOT 才稳定）
-      - name: Locate Android SDK and export env
+      - name: Export Android SDK env
         id: locate-sdk
         run: |
-          # 优先用环境变量，没有就找 cmdline-tools 默认装的位置
-          if [ -z "$ANDROID_SDK_ROOT" ] || [ ! -d "$ANDROID_SDK_ROOT" ]; then
-            # 尝试常见位置
-            for cand in "$HOME/Library/Android/sdk" "$HOME/Android/Sdk" "/opt/android-sdk" "/usr/lib/android-sdk"; do
-              if [ -d "$cand" ]; then ANDROID_SDK_ROOT="$cand"; break; fi
-            done
-          fi
-          if [ -z "$ANDROID_SDK_ROOT" ] || [ ! -d "$ANDROID_SDK_ROOT" ]; then
-            echo "::error::Android SDK not found after install step"
-            ls -R "$HOME" 2>/dev/null | head -40
+          # 镜像预装的 SDK 路径
+          SDK="/usr/local/lib/android/sdk"
+          if [ ! -d "$SDK" ]; then
+            echo "::error::Preinstalled Android SDK not found at $SDK"
+            ls -R /usr/local/lib 2>/dev/null | head -20
             exit 1
           fi
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" | tee -a "$GITHUB_ENV"
-          echo "ANDROID_HOME=$ANDROID_SDK_ROOT"     | tee -a "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" | tee -a "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/27.0.12077973" | tee -a "$GITHUB_ENV"
-          echo "PATH=$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK"                              >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK"                                  >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$SDK/ndk/27.0.12077973"             >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/27.0.12077973"             >> "$GITHUB_ENV"
+          echo "PATH=$SDK/platform-tools:$SDK/cmdline-tools/latest/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Install NDK / cmake / build-tools / platform
+        run: |
+          set -e
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "sdkmanager: $SDKMANAGER"
+          "$SDKMANAGER" --version
+          # 先收 licenses
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          # 单行空格分隔，避免 setup-android 的传参 bug
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.0.12077973" \
+            "cmake;3.22.1"
 
       - name: Verify NDK / cmake
         run: |
