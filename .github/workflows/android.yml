@@ -1,18 +1,9 @@
 name: Android
 
-# 既支持 push 自动触发（监听所有分支），也支持手动 workflow_dispatch，
-# 手动触发时可以在网页上选要构建哪个分支 / flavor。
+# 只支持手动触发。Actions 页面点 "Run workflow" 可以选分支和 tag（Action 自带）。
 on:
-  push:
-    branches:
-      - '**'
   workflow_dispatch:
     inputs:
-      ref:
-        description: '要构建的分支 / tag / SHA（留空则用默认分支）'
-        required: false
-        type: string
-        default: ''
       flavor:
         description: 'product flavor'
         required: true
@@ -37,7 +28,7 @@ on:
 
 concurrency:
   # 同分支串行，避免多 job 同时跑 ccache / 抢 NDK
-  group: android-${{ github.event.inputs.ref || github.ref }}
+  group: android-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -70,8 +61,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # workflow_dispatch 没填 ref 时，回退到 push 的 ref，再不行就用仓库默认分支
-          ref: ${{ inputs.ref || github.ref }}
+          # Action 自带分支选择，网页上选什么就拉什么
           submodules: recursive
           fetch-depth: 0   # 拉全部历史，build.gradle 里的 getGitVersion / getGitHash 会用到
           lfs: true
@@ -168,9 +158,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ matrix.abi }}-${{ inputs.build_type || 'relWithDebInfo' }}-${{ github.event.inputs.ref || github.ref }}-${{ github.sha }}
+          key: ccache-${{ matrix.abi }}-${{ inputs.build_type || 'relWithDebInfo' }}-${{ github.ref }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ matrix.abi }}-${{ inputs.build_type || 'relWithDebInfo' }}-${{ inputs.ref || github.ref }}-
+            ccache-${{ matrix.abi }}-${{ inputs.build_type || 'relWithDebInfo' }}-${{ github.ref }}-
 
       - name: Show ccache stats
         run: ccache -s | tee -a ccache.log
