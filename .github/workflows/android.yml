@@ -1,0 +1,302 @@
+name: Android
+
+# 既支持 push 自动触发（监听所有分支），也支持手动 workflow_dispatch，
+# 手动触发时可以在网页上选要构建哪个分支 / flavor。
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的分支 / tag / SHA（留空则用默认分支）'
+        required: false
+        type: string
+        default: ''
+      flavor:
+        description: 'product flavor'
+        required: true
+        type: choice
+        default: 'ea'
+        options:
+          - ea
+      build_type:
+        description: 'build type'
+        required: true
+        type: choice
+        default: 'relWithDebInfo'
+        options:
+          - relWithDebInfo
+          - release
+          - debug
+      abi:
+        description: '要打的 ABI（多个用空格分隔）'
+        required: true
+        type: string
+        default: 'arm64-v8a x86_64'
+
+concurrency:
+  # 同分支串行，避免多 job 同时跑 ccache / 抢 NDK
+  group: android-${{ github.event.inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Android (${{ matrix.abi }}, ${{ inputs.flavor || 'ea' }}-${{ inputs.build_type || 'relWithDebInfo' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        abi:
+          - arm64-v8a
+          # x86_64 体积大、用途少，默认不开；要全打就取消下面这行注释
+          # - x86_64
+
+    env:
+      # android-actions/setup-android 没有 outputs，我们手动在 step 里 export 到 GITHUB_ENV
+      # 这里只是占位，下面 step 会覆写
+      GRADLE_OPTS: '-Dorg.gradle.daemon=false -Xmx4g'
+      JAVA_TOOL_OPTIONS: '-Xmx4g'
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. 拉源码 —— 关键：ref 用 inputs 覆盖，submodules 要 recursive
+      # ---------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # workflow_dispatch 没填 ref 时，回退到 push 的 ref，再不行就用仓库默认分支
+          ref: ${{ inputs.ref || github.ref }}
+          submodules: recursive
+          fetch-depth: 0   # 拉全部历史，build.gradle 里的 getGitVersion / getGitHash 会用到
+          lfs: true
+
+      - name: Show checked-out ref
+        run: |
+          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+          echo "HEAD   = $(git rev-parse HEAD)"
+          echo "BRANCH = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
+          echo "REMOTE = $(git config --get remote.origin.url)"
+
+      # ---------------------------------------------------------------
+      # 2. JDK 17（AGP 8.x 要求 17）
+      # ---------------------------------------------------------------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ---------------------------------------------------------------
+      # 3. Android SDK + NDK 27 + cmake 3.22.1 + build-tools 35
+      #    android-actions/setup-android 不太稳，用官方的 cmdline-tools 自己装
+      # ---------------------------------------------------------------
+      - name: Install Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '11076708'   # latest cmdline-tools
+          packages: |
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
+            ndk;27.0.12077973
+            cmake;3.22.1
+
+      # android-actions/setup-android 没有 output，SDK 默认装到 ANDROID_SDK_ROOT
+      # （GitHub runner 上默认 $HOME/Library/Android/sdk 走 macOS；我们指定到 $ANDROID_SDK_ROOT 才稳定）
+      - name: Locate Android SDK and export env
+        id: locate-sdk
+        run: |
+          # 优先用环境变量，没有就找 cmdline-tools 默认装的位置
+          if [ -z "$ANDROID_SDK_ROOT" ] || [ ! -d "$ANDROID_SDK_ROOT" ]; then
+            # 尝试常见位置
+            for cand in "$HOME/Library/Android/sdk" "$HOME/Android/Sdk" "/opt/android-sdk" "/usr/lib/android-sdk"; do
+              if [ -d "$cand" ]; then ANDROID_SDK_ROOT="$cand"; break; fi
+            done
+          fi
+          if [ -z "$ANDROID_SDK_ROOT" ] || [ ! -d "$ANDROID_SDK_ROOT" ]; then
+            echo "::error::Android SDK not found after install step"
+            ls -R "$HOME" 2>/dev/null | head -40
+            exit 1
+          fi
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" | tee -a "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT"     | tee -a "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" | tee -a "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/27.0.12077973" | tee -a "$GITHUB_ENV"
+          echo "PATH=$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Verify NDK / cmake
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls -1 "$ANDROID_HOME/ndk/27.0.12077973/source.properties" 2>/dev/null \
+            && cat "$ANDROID_HOME/ndk/27.0.12077973/source.properties"
+          ls -1 "$ANDROID_HOME/cmake/3.22.1/bin/cmake"
+          "$ANDROID_HOME/cmake/3.22.1/bin/cmake" --version
+
+      # ---------------------------------------------------------------
+      # 4. Gradle 缓存（Android 项目里最大的加速点）
+      # ---------------------------------------------------------------
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.gradle/notifications
+          # 缓存 key 按 abi + build-type 切，但允许 fallback
+          key: gradle-${{ runner.os }}-${{ matrix.abi }}-${{ inputs.build_type || 'relWithDebInfo' }}-${{ hashFiles('src/android/gradle/wrapper/gradle-wrapper.properties', 'src/android/build.gradle.kts', 'src/android/app/build.gradle.kts') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ matrix.abi }}-${{ inputs.build_type || 'relWithDebInfo' }}-
+            gradle-${{ runner.os }}-
+
+      # ---------------------------------------------------------------
+      # 5. CCache（编译 native 部分用）—— sudachi 第一次冷构慢得离谱
+      # ---------------------------------------------------------------
+      - name: Prepare ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=5G"        >> $GITHUB_ENV
+
+      - name: ccache cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.abi }}-${{ inputs.build_type || 'relWithDebInfo' }}-${{ github.event.inputs.ref || github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.abi }}-${{ inputs.build_type || 'relWithDebInfo' }}-${{ inputs.ref || github.ref }}-
+
+      - name: Show ccache stats
+        run: ccache -s | tee -a ccache.log
+
+      # ---------------------------------------------------------------
+      # 6. 跑构建
+      #    默认我们用 relWithDebInfo（不需要 release key）。
+      #    想打正式 release 包？把 ANDROID_KEYSTORE_FILE 等塞到 repo secrets，
+      #    然后 workflow_dispatch 选 release 即可。
+      # ---------------------------------------------------------------
+      - name: Make gradlew executable
+        working-directory: src/android
+        run: chmod +x ./gradlew
+
+      - name: Show gradle / SDK info
+        working-directory: src/android
+        run: |
+          ./gradlew --version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          echo "ABI  = ${{ matrix.abi }}"
+          echo "FLAVOR = ${{ inputs.flavor || 'ea' }}"
+          echo "TYPE  = ${{ inputs.build_type || 'relWithDebInfo' }}"
+
+      - name: Build ${{ inputs.flavor || 'ea' }}-${{ inputs.build_type || 'relWithDebInfo' }} (${{ matrix.abi }})
+        working-directory: src/android
+        env:
+          # 只打当前 matrix 里的 ABI，加速 + 减小 artifact
+          ANDROID_ABI: ${{ matrix.abi }}
+          # 如果你想打开 LTO 关掉也行；目前沿用 build.gradle.kts 里的默认（ON）
+        run: |
+          FLAVOR="${{ inputs.flavor || 'ea' }}"
+          TYPE="${{ inputs.build_type || 'relWithDebInfo' }}"
+          ABI="${{ matrix.abi }}"
+
+          # 把 ABI 临时塞进 local.properties，避开 build.gradle.kts 硬编码 abiFilters 的限制
+          # （build.gradle.kts 里 abiFilters("arm64-v8a","x86_64")，所以这里我们直接走 gradle 的 -PreactNativeArchitectures 不适用
+          #  对应到 Android 端我们用 PROPERTY 走 abiSplit 让它只产目标 ABI）
+          cat > local.properties <<EOF
+          sdk.dir=${ANDROID_HOME}
+          ndk.dir=${ANDROID_NDK_HOME}
+          cmake.dir=${ANDROID_HOME}/cmake/3.22.1
+          EOF
+
+          # 单 ABI：用 -PreactNativeArchitectures 这种 React Native 风格的不行；
+          # 走 android.split 也没用。这里用一个更稳的办法：
+          #   临时把 build.gradle.kts 的 abiFilters 改成当前 matrix 的 ABI。
+          #   不想改源码的话，复制一份也行 —— 简单起见我们直接 sed 替换。
+          if [ "$ABI" != "arm64-v8a" ] && [ "$ABI" != "x86_64" ]; then
+            echo "::error::Unsupported ABI: $ABI"
+            exit 1
+          fi
+
+          # abiFilters 形如 abiFilters("arm64-v8a", "x86_64")，替换成 abiFilters("$ABI")
+          sed -i.bak -E "s/abiFilters\(\s*\"arm64-v8a\"\s*,\s*\"x86_64\"\s*\)/abiFilters(\"$ABI\")/g" \
+            app/build.gradle.kts
+          echo "Patched abiFilters -> $ABI"
+          grep -n "abiFilters" app/build.gradle.kts | head -3
+
+          # 关掉 ktlint —— CI 里跑 lint 没意义，还会拖时间
+          # AGP 的 assemble 任务名 = assemble + Flavor(CamelCase) + BuildType(CamelCase)
+          #   flavor=ea       -> Ea
+          #   buildType=relWithDebInfo -> RelWithDebInfo
+          #   最终 task = assembleEaRelWithDebInfo
+          FLAVOR_CC=$(awk -v f="$FLAVOR" 'BEGIN{print toupper(substr(f,1,1)) substr(f,2)}')
+          # 把 buildType 的首字母也大写（relWithDebInfo -> RelWithDebInfo）
+          BT_FIRST=$(echo "$TYPE" | cut -c1 | tr '[:lower:]' '[:upper:]')
+          BT_REST=$(echo "$TYPE" | cut -c2-)
+          TASK="assemble${FLAVOR_CC}${BT_FIRST}${BT_REST}"
+          echo "==> Gradle task: $TASK"
+
+          ./gradlew "$TASK" \
+            -x ktlintCheck -x ktlintKotlinScriptCheck -x ktlintMainSourceSetCheck \
+            --stacktrace --no-daemon \
+            -Pandroid.injected.signing.store.file=${{ secrets.ANDROID_KEYSTORE_FILE || '' }} \
+            -Pandroid.injected.signing.store.password=${{ secrets.ANDROID_KEYSTORE_PASS || '' }} \
+            -Pandroid.injected.signing.key.alias=${{ secrets.ANDROID_KEY_ALIAS || '' }} \
+            -Pandroid.injected.signing.key.password=${{ secrets.ANDROID_KEYSTORE_PASS || '' }}
+
+      - name: Show ccache final stats
+        if: always()
+        run: ccache -s | tee -a ccache.log
+
+      # ---------------------------------------------------------------
+      # 7. 产物上传（APK + AAB + native 库 + 构建日志）
+      # ---------------------------------------------------------------
+      - name: List output
+        if: always()
+        working-directory: src/android
+        run: |
+          echo "=== APKs ==="
+          find . -name "*.apk" -not -path "*/intermediates/*" -exec ls -lh {} +
+          echo "=== AABs ==="
+          find . -name "*.aab" -not -path "*/intermediates/*" -exec ls -lh {} +
+          echo "=== jniLibs (sample) ==="
+          find . -path "*/jniLibs/*" -name "*.so" | head -20
+
+      - name: Upload APKs / AABs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudachi-android-${{ inputs.flavor || 'ea' }}-${{ inputs.build_type || 'relWithDebInfo' }}-${{ matrix.abi }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            src/android/app/build/outputs/apk/**/*.apk
+            src/android/app/build/outputs/bundle/**/*.aab
+
+      - name: Upload native libs (for local debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudachi-jniLibs-${{ inputs.build_type || 'relWithDebInfo' }}-${{ matrix.abi }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            src/android/app/build/intermediates/merged_native_libs/**/out/lib/**/*.so
+            src/android/app/build/intermediates/stripped_native_libs/**/*.so
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudachi-build-log-${{ matrix.abi }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ccache.log
+            src/android/app/build/reports/**
