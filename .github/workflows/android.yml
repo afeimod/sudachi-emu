@@ -62,9 +62,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           # Action 自带分支选择，网页上选什么就拉什么
-          submodules: recursive
+          # submodules 留 false，下面用 step 显式 init，避开 checkout 静默拉空
+          submodules: false
           fetch-depth: 0   # 拉全部历史，build.gradle 里的 getGitVersion / getGitHash 会用到
           lfs: true
+
+      # actions/checkout@v4 拉子模块不稳（坑在 token 传递 + 父仓库深度限制），
+      # 项目里 externals/vcpkg、externals/enet 等 20+ 个子模块在 CI 上会拉空，
+      # 导致 CMake 报 "vcpkg.cmake not found" / "submodule enet not found"。
+      # 手动 init 一次，靠 GITHUB_TOKEN 走 https，对 public 子模块够用。
+      - name: Init submodules
+        run: |
+          set -e
+          git config --global --add safe.directory '*'
+          git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          echo "=== submodule status ==="
+          git submodule status | head -30
+          echo "=== sanity check ==="
+          test -f externals/vcpkg/scripts/buildsystems/vcpkg.cmake && echo "vcpkg OK" || (echo "vcpkg MISSING" && exit 1)
+          test -d externals/enet  && echo "enet OK"    || (echo "enet MISSING"  && exit 1)
 
       - name: Show checked-out ref
         run: |
